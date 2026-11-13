@@ -1,5 +1,5 @@
 from __future__ import absolute_import, division, unicode_literals
-from six import viewkeys
+from six import integer_types, viewkeys
 
 from . import _inputstream
 from . import _tokenizer
@@ -21,7 +21,75 @@ from .constants import (
 )
 
 
-def parse(doc, treebuilder="etree", namespaceHTMLElements=True, **kwargs):
+class ParseBudgetExceeded(Exception):
+    """Raised when a parse budget limit is exceeded
+
+    The parser raises this instead of returning a partial tree, so callers
+    can rely on the fact that a successfully returned tree is complete.
+
+    """
+
+    def __init__(self, resource, limit, actual):
+        self.resource = resource
+        self.limit = limit
+        self.actual = actual
+        super(ParseBudgetExceeded, self).__init__(
+            "parse budget exceeded: %s limit of %r reached (%r consumed)" %
+            (resource, limit, actual))
+
+
+class ParseBudget(object):
+    """Resource limits applied while parsing a document or fragment
+
+    All limits are optional; a limit of :obj:`None` means the corresponding
+    resource is not constrained.
+
+    :arg max_depth: maximum number of elements on the stack of open
+        elements (i.e. the nesting depth of the tree being built)
+
+    :arg max_tokens: maximum number of tokens (tags, comments, doctypes and
+        character data runs) consumed from the tokenizer
+
+    :arg max_text: maximum cumulative number of characters of character
+        data consumed
+
+    """
+
+    __slots__ = ("max_depth", "max_tokens", "max_text")
+
+    def __init__(self, max_depth=None, max_tokens=None, max_text=None):
+        for name, value in (("max_depth", max_depth),
+                            ("max_tokens", max_tokens),
+                            ("max_text", max_text)):
+            if value is not None:
+                if not isinstance(value, integer_types) or value < 0:
+                    raise ValueError("%s must be a non-negative integer or "
+                                     "None, got %r" % (name, value))
+        self.max_depth = max_depth
+        self.max_tokens = max_tokens
+        self.max_text = max_text
+
+    @classmethod
+    def fromValue(cls, value):
+        """Coerce ``value`` into a :class:`ParseBudget` or :obj:`None`
+
+        Accepts a :class:`ParseBudget`, a dict of keyword arguments, or
+        :obj:`None`.
+
+        """
+        if value is None or isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        raise TypeError("budget must be a ParseBudget, dict or None, got %r" %
+                        (value,))
+
+    def __repr__(self):
+        return ("ParseBudget(max_depth=%r, max_tokens=%r, max_text=%r)" %
+                (self.max_depth, self.max_tokens, self.max_text))
+
+
+def parse(doc, treebuilder="etree", namespaceHTMLElements=True, budget=None, **kwargs):
     """Parse an HTML document as a string or file-like object into a tree
 
     :arg doc: the document to parse as a string or file-like object
@@ -29,6 +97,10 @@ def parse(doc, treebuilder="etree", namespaceHTMLElements=True, **kwargs):
     :arg treebuilder: the treebuilder to use when parsing
 
     :arg namespaceHTMLElements: whether or not to namespace HTML elements
+
+    :arg budget: a :class:`ParseBudget` (or equivalent dict) limiting parse
+        resource consumption; a :class:`ParseBudgetExceeded` error is raised
+        if a limit is exceeded
 
     :returns: parsed tree
 
@@ -40,11 +112,11 @@ def parse(doc, treebuilder="etree", namespaceHTMLElements=True, **kwargs):
 
     """
     tb = treebuilders.getTreeBuilder(treebuilder)
-    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements)
+    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements, budget=budget)
     return p.parse(doc, **kwargs)
 
 
-def parseFragment(doc, container="div", treebuilder="etree", namespaceHTMLElements=True, **kwargs):
+def parseFragment(doc, container="div", treebuilder="etree", namespaceHTMLElements=True, budget=None, **kwargs):
     """Parse an HTML fragment as a string or file-like object into a tree
 
     :arg doc: the fragment to parse as a string or file-like object
@@ -54,6 +126,10 @@ def parseFragment(doc, container="div", treebuilder="etree", namespaceHTMLElemen
     :arg treebuilder: the treebuilder to use when parsing
 
     :arg namespaceHTMLElements: whether or not to namespace HTML elements
+
+    :arg budget: a :class:`ParseBudget` (or equivalent dict) limiting parse
+        resource consumption; a :class:`ParseBudgetExceeded` error is raised
+        if a limit is exceeded
 
     :returns: parsed tree
 
@@ -65,7 +141,7 @@ def parseFragment(doc, container="div", treebuilder="etree", namespaceHTMLElemen
 
     """
     tb = treebuilders.getTreeBuilder(treebuilder)
-    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements)
+    p = HTMLParser(tb, namespaceHTMLElements=namespaceHTMLElements, budget=budget)
     return p.parseFragment(doc, container=container, **kwargs)
 
 
@@ -76,7 +152,7 @@ class HTMLParser(object):
 
     """
 
-    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True, debug=False):
+    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True, debug=False, budget=None):
         """
         :arg tree: a treebuilder class controlling the type of tree that will be
             returned. Built in treebuilders can be accessed through
@@ -87,6 +163,14 @@ class HTMLParser(object):
         :arg namespaceHTMLElements: whether or not to namespace HTML elements
 
         :arg debug: whether or not to enable debug mode which logs things
+
+        :arg budget: a :class:`ParseBudget` (or equivalent dict) limiting
+            parse resource consumption. The same budget applies to document
+            and fragment parsing, and the consumed amounts are reset every
+            time the parser is reused. If a limit is exceeded,
+            :class:`ParseBudgetExceeded` is raised and no (partial) tree is
+            returned. By default no budget is enforced and the parser
+            behaves as before.
 
         Example:
 
@@ -99,6 +183,8 @@ class HTMLParser(object):
         # Raise an exception on the first error encountered
         self.strict = strict
         self.debug = debug
+
+        self.budget = ParseBudget.fromValue(budget)
 
         if tree is None:
             tree = treebuilders.getTreeBuilder("etree")
@@ -130,6 +216,11 @@ class HTMLParser(object):
         self.firstStartTag = False
         self.errors = []
         self.log = []  # only used with debug mode
+        # parse budget consumption so far; restarting the parse (including
+        # reusing the parser for another document) starts the budget afresh
+        self._budgetTokens = 0
+        self._budgetText = 0
+        self._budgetDepth = 0
         # "quirks" / "limited quirks" / "no quirks"
         self.compatMode = "no quirks"
 
@@ -193,8 +284,11 @@ class HTMLParser(object):
 
         type_names = {value: key for key, value in tokenTypes.items()}
         debug = self.debug
+        budget = self.budget
 
         for token in self.tokenizer:
+            if budget is not None:
+                self._consumeTokenBudget(token)
             prev_token = None
             new_token = token
             while new_token is not None:
@@ -249,6 +343,9 @@ class HTMLParser(object):
                     elif type == DoctypeToken:
                         new_token = phase.processDoctype(new_token)
 
+                    if budget is not None:
+                        self._checkDepthBudget()
+
             if (type == StartTagToken and prev_token["selfClosing"] and
                     not prev_token["selfClosingAcknowledged"]):
                 self.parseError("non-void-element-with-trailing-solidus",
@@ -260,8 +357,43 @@ class HTMLParser(object):
         while reprocess:
             phases.append(self.phase)
             reprocess = self.phase.processEOF()
+            if budget is not None:
+                self._checkDepthBudget()
             if reprocess:
                 assert self.phase not in phases
+
+    def _consumeTokenBudget(self, token):
+        # Count every token handed to the tree construction stage, whatever
+        # phase ends up processing it (including table foster parenting and
+        # foreign content). Counting tokenizer output rather than input
+        # chunks keeps the consumption identical for chunked and one-shot
+        # input. Parse errors are reported through the usual error channel
+        # and do not consume budget.
+        type = token["type"]
+        if type == tokenTypes["ParseError"]:
+            return
+        budget = self.budget
+        self._budgetTokens += 1
+        if (budget.max_tokens is not None and
+                self._budgetTokens > budget.max_tokens):
+            raise ParseBudgetExceeded("tokens", budget.max_tokens,
+                                      self._budgetTokens)
+        if type in (tokenTypes["Characters"], tokenTypes["SpaceCharacters"]):
+            self._budgetText += len(token["data"])
+            if (budget.max_text is not None and
+                    self._budgetText > budget.max_text):
+                raise ParseBudgetExceeded("text", budget.max_text,
+                                          self._budgetText)
+
+    def _checkDepthBudget(self):
+        budget = self.budget
+        if budget.max_depth is None:
+            return
+        depth = len(self.tree.openElements)
+        if depth > self._budgetDepth:
+            self._budgetDepth = depth
+        if depth > budget.max_depth:
+            raise ParseBudgetExceeded("depth", budget.max_depth, depth)
 
     def parse(self, stream, *args, **kwargs):
         """Parse a HTML document into a well-formed tree

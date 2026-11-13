@@ -8,6 +8,11 @@ Unreleased yet
 
 Features:
 
+* Add an optional parse budget (``budget=`` on ``HTMLParser``, ``parse``
+  and ``parseFragment``) limiting nesting depth, token count and cumulative
+  text consumed while parsing. Exceeding a limit raises
+  ``html5lib.ParseBudgetExceeded`` instead of returning a partial tree.
+
 * Add support for the ``<wbr>`` element in the sanitizer, `which indicates
   a line break opportunity <https://html.spec.whatwg.org/#the-wbr-element>`_.
   This element is allowed by default. (#395) (Thank you, Tom Most!)
